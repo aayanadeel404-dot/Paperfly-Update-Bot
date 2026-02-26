@@ -230,9 +230,6 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
             await page.wait_for_load_state("networkidle")
             await page.wait_for_timeout(4000)
 
-            ss_data = await page.screenshot(full_page=False)
-            screenshot_b64 = base64.b64encode(ss_data).decode()
-
             await progress("📊 Extracting order data...")
             rows = await page.query_selector_all("table tbody tr")
 
@@ -264,7 +261,7 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
                     "order_href": order_href, "status": status,
                     "collected": collected, "merchant_order_id": merch_oid,
                     "customer_details": customer, "price": price,
-                    "timeline": [],
+                    "timeline": [], "screenshot_b64": None,
                 })
 
             if orders:
@@ -310,6 +307,12 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
                         await lnk.click()
                         await page.wait_for_load_state("networkidle")
                         await page.wait_for_timeout(3000)
+                        # Screenshot of the order detail page
+                        try:
+                            ss = await page.screenshot(full_page=True)
+                            order["screenshot_b64"] = base64.b64encode(ss).decode()
+                        except Exception:
+                            pass
                         result = await page.evaluate("""() => {
                             for (const d of document.querySelectorAll('div')) {
                                 if (d.childElementCount === 0 && d.innerText.trim() === 'Timeline') {
@@ -480,22 +483,27 @@ async def run_tracking(update: Update, phone: str, days_back: int):
 
     result_text = format_full_result(data)
 
-    if data["screenshot_b64"]:
-        try:
-            import io
-            await update.message.reply_photo(
-                photo=io.BytesIO(base64.b64decode(data["screenshot_b64"])),
-                caption="📸 Search results",
-            )
-        except Exception as e:
-            log.warning(f"Screenshot send failed: {e}")
-
+    import io
     if len(result_text) <= 4000:
         await msg.edit_text(result_text, parse_mode=ParseMode.MARKDOWN)
     else:
         await msg.edit_text(f"📱 *{data['phone']}* — {len(data['orders'])} orders", parse_mode=ParseMode.MARKDOWN)
-        for i, order in enumerate(data["orders"], 1):
-            chunk = format_order(order, i)
+
+    # Send screenshot + detail for each order
+    for i, order in enumerate(data["orders"], 1):
+        chunk = format_order(order, i)
+        if order.get("screenshot_b64"):
+            try:
+                await update.message.reply_photo(
+                    photo=io.BytesIO(base64.b64decode(order["screenshot_b64"])),
+                    caption=chunk[:1024],
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception as e:
+                log.warning(f"Order screenshot failed: {e}")
+                if len(chunk) <= 4000:
+                    await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
+        elif len(data["orders"]) > 1:
             if len(chunk) <= 4000:
                 await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
 
