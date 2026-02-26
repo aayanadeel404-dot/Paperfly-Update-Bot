@@ -434,7 +434,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def run_tracking(update: Update, phone: str, days_back: int):
     msg = await update.message.reply_text(
-        f"🔍 Starting search for `{phone}`...\n⏳ This takes ~60–90 seconds.",
+        f"🔍 Starting search for `{phone}`...\n⏳ This takes 1–3 minutes.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -448,8 +448,35 @@ async def run_tracking(update: Update, phone: str, days_back: int):
         except Exception:
             pass
 
-    await update.message.chat.send_action(ChatAction.TYPING)
-    data = await scrape_orders(phone, days_back, progress_cb=on_progress)
+    # Keep "typing" indicator alive every 4 seconds
+    stop_typing = asyncio.Event()
+    async def keep_typing():
+        while not stop_typing.is_set():
+            try:
+                await update.message.chat.send_action(ChatAction.TYPING)
+            except Exception:
+                pass
+            await asyncio.sleep(4)
+
+    typing_task = asyncio.create_task(keep_typing())
+
+    try:
+        data = await asyncio.wait_for(
+            scrape_orders(phone, days_back, progress_cb=on_progress),
+            timeout=300,  # 5 minute hard limit
+        )
+    except asyncio.TimeoutError:
+        stop_typing.set()
+        typing_task.cancel()
+        await msg.edit_text(
+            "⏰ *Timed out* — search took longer than 5 minutes.\n"
+            "Try again or use a shorter date range: `/track " + phone + " 30`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    finally:
+        stop_typing.set()
+        typing_task.cancel()
 
     if data["error"]:
         await msg.edit_text(
