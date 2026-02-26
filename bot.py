@@ -231,13 +231,18 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
             await page.wait_for_timeout(4000)
 
             await progress("📊 Extracting order data...")
+            # Try multiple selectors for the table rows
             rows = await page.query_selector_all("table tbody tr")
+            if not rows:
+                rows = await page.query_selector_all("tr[class*='MuiTableRow']")
+            log.debug(f"Found {len(rows)} table rows")
 
             for i, row in enumerate(rows):
                 cells = await row.query_selector_all("td")
                 if len(cells) < 2:
                     continue
-                order_link = await row.query_selector("a[href*='/merchant/single-order-history/']")
+                # Try multiple link patterns
+                order_link = await row.query_selector("a[href*='single-order-history']")
                 order_id, order_href = "", ""
                 if order_link:
                     order_id = (await order_link.inner_text()).strip()
@@ -248,12 +253,22 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
                     c = cells[idx] if idx < len(cells) else None
                     return (await c.inner_text()).strip() if c else ""
                 order_date = await ct(offset)
-                if not order_id: order_id = await ct(offset + 1)
+                # Always try fallback for order_id
+                if not order_id:
+                    order_id = await ct(offset + 1)
+                # Look for Z-XXXXXX pattern in any cell text
+                if not order_id:
+                    import re
+                    row_text = await row.inner_text()
+                    m = re.search(r'Z-[0-9]{6}-[0-9]{6}-[A-Z0-9]+-[A-Z0-9]+', row_text)
+                    if m:
+                        order_id = m.group(0)
                 status     = await ct(offset + 2)
                 collected  = await ct(offset + 3)
                 merch_oid  = await ct(offset + 4)
                 customer   = await ct(offset + 5)
                 price      = await ct(offset + 6)
+                log.debug(f"Row {i}: order_id={order_id!r}, href={order_href!r}, status={status!r}")
                 if not order_id:
                     continue
                 orders.append({
