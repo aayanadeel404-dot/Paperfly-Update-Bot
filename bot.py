@@ -127,14 +127,21 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
 
             await login_btn.click()
             await page.wait_for_load_state("networkidle")
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(3000)
+
+            log.info(f"Post-login URL: {page.url}")
 
             if "/identity/login" in page.url:
                 await p_inp.press("Enter")
-                await page.wait_for_timeout(3000)
+                await page.wait_for_timeout(4000)
                 await page.wait_for_load_state("networkidle")
+                log.info(f"Post-Enter URL: {page.url}")
                 if "/identity/login" in page.url:
                     raise Exception("Login failed — check credentials")
+
+            # Extra wait to ensure session cookies are fully set
+            await page.wait_for_timeout(2000)
+            log.info(f"Confirmed logged in. URL: {page.url}")
 
             await progress("✅ Logged in! Opening Order History...")
 
@@ -308,9 +315,19 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
                 try:
                     # Directly navigate to order detail page
                     full_url = f"https://go.paperfly.com.bd{order['order_href']}"
+                    log.debug(f"Navigating to: {full_url}")
                     await page.goto(full_url)
                     await page.wait_for_load_state("networkidle")
                     await page.wait_for_timeout(3000)
+
+                    # Check if we got redirected to login page
+                    current_url = page.url
+                    log.debug(f"Current URL after navigation: {current_url}")
+                    if "/identity/login" in current_url or "/login" in current_url:
+                        log.warning("Session expired — redirected to login. Skipping screenshot.")
+                        order["timeline"] = ["⚠️ Session expired during detail fetch"]
+                        continue
+
                     if True:
                         # Screenshot of the order detail page
                         try:
