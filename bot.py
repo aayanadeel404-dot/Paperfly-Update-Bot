@@ -1,0 +1,561 @@
+"""
+Paperfly Tracker — Telegram Bot
+Commands:
+  /start   — welcome message
+  /track   <phone> [days] — track orders
+  /help    — usage help
+"""
+
+import asyncio
+import base64
+import logging
+import os
+import re
+from datetime import datetime, timedelta
+
+import requests
+from playwright.async_api import async_playwright
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+from telegram.constants import ParseMode, ChatAction
+
+# ── Config ────────────────────────────────────────────────────────────────────
+BOT_TOKEN          = os.environ["TELEGRAM_BOT_TOKEN"]
+PAPERFLY_USERNAME  = os.environ.get("PAPERFLY_USERNAME", "C172058")
+PAPERFLY_PASSWORD  = os.environ.get("PAPERFLY_PASSWORD", "7420")
+DEEPSEEK_API_KEY   = os.environ.get("DEEPSEEK_API_KEY", "")
+PAPERFLY_LOGIN_URL = "https://go.paperfly.com.bd/identity/login"
+PAPERFLY_ORDER_URL = "https://go.paperfly.com.bd/merchant/order-history"
+
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger(__name__)
+
+# ── Phone normalization ────────────────────────────────────────────────────────
+def normalize_phone_local(raw: str) -> str:
+    bangla = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
+    num = raw.translate(bangla)
+    num = re.sub(r"[^\d]", "", num)
+    if num.startswith("8801"):   num = "0" + num[3:]
+    elif num.startswith("880"):  num = "0" + num[3:]
+    elif num.startswith("88"):   num = "0" + num[2:]
+    return num
+
+def normalize_phone(raw: str) -> str:
+    if DEEPSEEK_API_KEY:
+        try:
+            resp = requests.post(
+                "https://api.deepseek.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": "deepseek-chat",
+                    "messages": [{"role": "user", "content":
+                        f"Normalize to 01XXXXXXXXX (11 digits). Strip +88/880/88. Convert Bangla digits. Return ONLY the number.\nInput: {raw}"}],
+                    "max_tokens": 20,
+                },
+                timeout=10,
+            )
+            result = resp.json()["choices"][0]["message"]["content"].strip()
+            if re.match(r"^01\d{9}$", result):
+                return result
+        except Exception:
+            pass
+    return normalize_phone_local(raw)
+
+# ── Playwright scraper ─────────────────────────────────────────────────────────
+async def type_field(el, page, text: str):
+    await el.click()
+    await page.keyboard.press("Control+a")
+    await page.keyboard.press("Delete")
+    await page.wait_for_timeout(150)
+    await page.keyboard.type(text, delay=70)
+    await page.wait_for_timeout(350)
+
+async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
+    """Scrape Paperfly and return order data. progress_cb(msg) called with status updates."""
+
+    async def progress(msg: str):
+        log.info(msg)
+        if progress_cb:
+            await progress_cb(msg)
+
+    orders = []
+    screenshot_b64 = None
+    error = None
+
+    try:
+        await progress("🔍 Normalizing phone number...")
+        normalized = normalize_phone(phone)
+        await progress(f"📱 Phone: `{normalized}`")
+
+        await progress("🚀 Launching browser...")
+        async with async_playwright() as p:
+            browser = await p.firefox.launch(headless=True)
+            ctx = await browser.new_context(viewport={"width": 1366, "height": 900})
+            page = await ctx.new_page()
+
+            # Login
+            await progress("🔐 Logging into Paperfly...")
+            await page.goto(PAPERFLY_LOGIN_URL)
+            await page.wait_for_timeout(5000)
+
+            u_inp = await page.wait_for_selector("input[type='text'].MuiInputBase-input", timeout=15000)
+            await type_field(u_inp, page, PAPERFLY_USERNAME)
+
+            p_inp = await page.wait_for_selector("input[type='password']", timeout=10000)
+            await type_field(p_inp, page, PAPERFLY_PASSWORD)
+            await page.wait_for_timeout(400)
+
+            login_btn = None
+            for sel in ["button[type='submit']", "button.MuiButton-containedPrimary",
+                        "button:has-text('Login')", "button:has-text('Sign In')"]:
+                try:
+                    login_btn = await page.wait_for_selector(sel, timeout=3000)
+                    break
+                except Exception:
+                    pass
+
+            if not login_btn:
+                raise Exception("Login button not found")
+
+            await login_btn.click()
+            await page.wait_for_load_state("networkidle")
+            await page.wait_for_timeout(2000)
+
+            if "/identity/login" in page.url:
+                await p_inp.press("Enter")
+                await page.wait_for_timeout(3000)
+                await page.wait_for_load_state("networkidle")
+                if "/identity/login" in page.url:
+                    raise Exception("Login failed — check credentials")
+
+            await progress("✅ Logged in! Opening Order History...")
+
+            # Navigate to order history
+            oh_link = None
+            for sel in ["text=Order History", "a[href*='order-history']", "span:has-text('Order History')"]:
+                try:
+                    oh_link = await page.wait_for_selector(sel, timeout=4000)
+                    break
+                except Exception:
+                    pass
+
+            if oh_link:
+                await oh_link.click()
+                await page.wait_for_load_state("networkidle")
+                await page.wait_for_timeout(2000)
+            else:
+                await page.goto(PAPERFLY_ORDER_URL)
+                await page.wait_for_load_state("networkidle")
+                await page.wait_for_timeout(2000)
+
+            # Wait for page to render
+            await progress("⏳ Waiting for page to render...")
+            found = False
+            for _ in range(30):
+                await page.wait_for_timeout(1000)
+                mui = await page.query_selector_all("input.MuiInputBase-input")
+                btns = await page.query_selector_all("button.MuiButton-containedPrimary")
+                if len(mui) >= 1 and len(btns) >= 1:
+                    found = True
+                    break
+
+            if not found:
+                raise Exception("Order history page did not render in time")
+
+            # Fill search form
+            await progress(f"🔎 Searching orders for `{normalized}`...")
+            all_mui = await page.query_selector_all("input.MuiInputBase-input")
+
+            phone_inp = None
+            for inp in all_mui:
+                ph = (await inp.get_attribute("placeholder") or "").lower()
+                if any(k in ph for k in ["phone", "order", "search"]):
+                    phone_inp = inp
+                    break
+            if not phone_inp:
+                phone_inp = all_mui[0]
+
+            await type_field(phone_inp, page, normalized)
+
+            start_date = (datetime.now() - timedelta(days=days_back)).strftime("%m/%d/%Y")
+            date_inp = None
+            for inp in all_mui:
+                ph = (await inp.get_attribute("placeholder") or "").lower()
+                if any(k in ph for k in ["date", "from", "start", "mm/dd"]):
+                    date_inp = inp
+                    break
+            if not date_inp and len(all_mui) > 1:
+                date_inp = all_mui[1]
+            if date_inp:
+                await type_field(date_inp, page, start_date)
+
+            # Click search
+            search_btns = await page.query_selector_all("button.MuiButton-containedPrimary")
+            search_btn = None
+            for btn in search_btns:
+                txt = (await btn.inner_text()).strip().lower()
+                if any(k in txt for k in ["search", "find", "filter"]):
+                    search_btn = btn
+                    break
+            if not search_btn:
+                search_btn = search_btns[-1] if search_btns else None
+
+            if not search_btn:
+                raise Exception("Search button not found")
+
+            await search_btn.click()
+            await page.wait_for_load_state("networkidle")
+            await page.wait_for_timeout(4000)
+
+            # Screenshot
+            ss_data = await page.screenshot(full_page=False)
+            screenshot_b64 = base64.b64encode(ss_data).decode()
+
+            # Extract table
+            await progress("📊 Extracting order data...")
+            rows = await page.query_selector_all("table tbody tr")
+
+            for i, row in enumerate(rows):
+                cells = await row.query_selector_all("td")
+                if len(cells) < 2:
+                    continue
+
+                order_link = await row.query_selector("a[href*='single-order-history']")
+                order_id, order_href = "", ""
+                if order_link:
+                    order_id = (await order_link.inner_text()).strip()
+                    order_href = await order_link.get_attribute("href") or ""
+
+                has_cb = await cells[0].query_selector("input[type='checkbox']")
+                offset = 1 if has_cb else 0
+
+                async def ct(idx):
+                    c = cells[idx] if idx < len(cells) else None
+                    return (await c.inner_text()).strip() if c else ""
+
+                order_date  = await ct(offset)
+                if not order_id: order_id = await ct(offset + 1)
+                status      = await ct(offset + 2)
+                collected   = await ct(offset + 3)
+                merch_oid   = await ct(offset + 4)
+                customer    = await ct(offset + 5)
+                price       = await ct(offset + 6)
+
+                if not order_id:
+                    continue
+
+                orders.append({
+                    "order_id": order_id, "order_date": order_date,
+                    "order_href": order_href, "status": status,
+                    "collected": collected, "merchant_order_id": merch_oid,
+                    "customer_details": customer, "price": price,
+                    "timeline": [],
+                })
+
+            # Timelines
+            if orders:
+                await progress(f"📍 Fetching timelines for {len(orders)} order(s)...")
+
+            async def do_search_again():
+                for _ in range(20):
+                    await page.wait_for_timeout(1000)
+                    m = await page.query_selector_all("input.MuiInputBase-input")
+                    b = await page.query_selector_all("button.MuiButton-containedPrimary")
+                    if m and b:
+                        break
+                m = await page.query_selector_all("input.MuiInputBase-input")
+                if m:
+                    await type_field(m[0], page, normalized)
+                b = await page.query_selector_all("button.MuiButton-containedPrimary")
+                for btn in b:
+                    if "search" in (await btn.inner_text()).lower():
+                        await btn.click()
+                        break
+                else:
+                    if b: await b[0].click()
+                await page.wait_for_load_state("networkidle")
+                await page.wait_for_timeout(4000)
+
+            for oi, order in enumerate(orders):
+                if not order["order_href"]:
+                    continue
+                try:
+                    oh = await page.query_selector("text=Order History")
+                    if oh: await oh.click()
+                    else: await page.goto(PAPERFLY_ORDER_URL)
+                    await page.wait_for_load_state("networkidle")
+                    await page.wait_for_timeout(2000)
+                    await do_search_again()
+
+                    lnk = None
+                    for sel in [f"a[href='{order['order_href']}']",
+                                f"a[href*='{order['order_id']}']",
+                                "a[href*='single-order-history']"]:
+                        lnk = await page.query_selector(sel)
+                        if lnk: break
+
+                    if lnk:
+                        await lnk.click()
+                        await page.wait_for_load_state("networkidle")
+                        await page.wait_for_timeout(3000)
+
+                        result = await page.evaluate("""() => {
+                            for (const d of document.querySelectorAll('div')) {
+                                if (d.childElementCount === 0 && d.innerText.trim() === 'Timeline') {
+                                    let p = d.parentElement;
+                                    for (let i = 0; i < 8; i++) {
+                                        if (p && p.children.length > 1) return { found: true, text: p.innerText };
+                                        if (p) p = p.parentElement;
+                                    }
+                                }
+                            }
+                            return { found: false, text: '' };
+                        }""")
+
+                        if result["found"]:
+                            order["timeline"] = [
+                                l.strip() for l in result["text"].split("\n")
+                                if l.strip() and l.strip() != "Timeline"
+                            ]
+                except Exception as te:
+                    log.warning(f"Timeline error for {order['order_id']}: {te}")
+
+            await browser.close()
+
+        return {
+            "phone": normalized,
+            "orders": orders,
+            "screenshot_b64": screenshot_b64,
+            "error": None,
+        }
+
+    except Exception as e:
+        log.error(f"Scrape error: {e}")
+        return {"phone": phone, "orders": [], "screenshot_b64": None, "error": str(e)}
+
+# ── Telegram helpers ───────────────────────────────────────────────────────────
+STATUS_EMOJI = {
+    "delivered": "✅", "return": "🔄", "cancel": "❌",
+    "pending": "🕐", "transit": "🚚", "pickup": "📦", "point": "📍",
+}
+
+def status_emoji(status: str) -> str:
+    s = (status or "").lower()
+    for key, emoji in STATUS_EMOJI.items():
+        if key in s:
+            return emoji
+    return "📋"
+
+def format_order(order: dict, idx: int) -> str:
+    emoji = status_emoji(order["status"])
+    lines = [
+        f"*{idx}. {order['order_id']}*",
+        f"{emoji} {order['status']}",
+        f"📅 {order['order_date']}",
+        f"💰 {order['price']}",
+        f"👤 {order['customer_details']}",
+    ]
+    if order.get("timeline"):
+        lines.append("📍 *Timeline:*")
+        for t in order["timeline"][:6]:  # cap at 6 entries
+            lines.append(f"  • {t}")
+        if len(order["timeline"]) > 6:
+            lines.append(f"  _...+{len(order['timeline'])-6} more_")
+    return "\n".join(lines)
+
+def format_full_result(data: dict) -> str:
+    orders = data["orders"]
+    phone = data["phone"]
+    if not orders:
+        return f"📭 No orders found for `{phone}`"
+
+    # Summary
+    status_counts: dict[str, int] = {}
+    for o in orders:
+        status_counts[o["status"]] = status_counts.get(o["status"], 0) + 1
+
+    summary_parts = [f"Total: *{len(orders)}*"]
+    for k, v in status_counts.items():
+        summary_parts.append(f"{status_emoji(k)} {k}: *{v}*")
+
+    lines = [
+        f"📱 *{phone}*",
+        " | ".join(summary_parts),
+        "─" * 30,
+    ]
+
+    for i, order in enumerate(orders, 1):
+        lines.append(format_order(order, i))
+        if i < len(orders):
+            lines.append("─" * 20)
+
+    return "\n".join(lines)
+
+# ── Command handlers ───────────────────────────────────────────────────────────
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 *Welcome to Paperfly Tracker Bot!*\n\n"
+        "Track your customer orders directly from Telegram.\n\n"
+        "*How to use:*\n"
+        "Just send a phone number:\n"
+        "`01712345678`\n\n"
+        "Or use the command:\n"
+        "`/track 01712345678`\n"
+        "`/track 01712345678 60` _(last 60 days)_\n\n"
+        "Type /help for more info.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 *Paperfly Tracker — Help*\n\n"
+        "*Commands:*\n"
+        "`/track <phone>` — track with 90-day range\n"
+        "`/track <phone> <days>` — custom range (e.g. 30, 60, 180)\n\n"
+        "*Quick track:*\n"
+        "Just send any phone number directly!\n"
+        "Supports Bangla digits (০১৭১২৩৪৫৬৭৮) too.\n\n"
+        "*Examples:*\n"
+        "`01712345678`\n"
+        "`+8801712345678`\n"
+        "`০১৭১২৩৪৫৬৭৮`",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+async def run_tracking(update: Update, phone: str, days_back: int):
+    msg = await update.message.reply_text(
+        f"🔍 Starting search for `{phone}`...\n⏳ This takes ~60–90 seconds.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    # Live progress updates
+    last_text = [""]
+    async def on_progress(text: str):
+        new_text = f"{last_text[0]}\n{text}".strip()
+        last_text[0] = new_text
+        try:
+            await msg.edit_text(new_text, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+    data = await scrape_orders(phone, days_back, progress_cb=on_progress)
+
+    if data["error"]:
+        await msg.edit_text(
+            f"❌ *Error:*\n`{data['error']}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    result_text = format_full_result(data)
+
+    # Send screenshot first if available
+    if data["screenshot_b64"]:
+        try:
+            import io
+            img_bytes = base64.b64decode(data["screenshot_b64"])
+            await update.message.reply_photo(
+                photo=io.BytesIO(img_bytes),
+                caption="📸 Search results screenshot",
+            )
+        except Exception as e:
+            log.warning(f"Could not send screenshot: {e}")
+
+    # Send text result (split if too long)
+    if len(result_text) <= 4000:
+        await msg.edit_text(result_text, parse_mode=ParseMode.MARKDOWN)
+    else:
+        # Send in chunks per order
+        await msg.edit_text(
+            f"📱 *{data['phone']}* — {len(data['orders'])} orders found",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        for i, order in enumerate(data["orders"], 1):
+            chunk = format_order(order, i)
+            if len(chunk) <= 4000:
+                await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
+
+    # Share buttons
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 Share to WhatsApp", url=whatsapp_url(data))],
+        [InlineKeyboardButton("🔄 Search Again", callback_data=f"retrack:{phone}:{days_back}")],
+    ])
+    await update.message.reply_text("Options:", reply_markup=keyboard)
+
+def whatsapp_url(data: dict) -> str:
+    import urllib.parse
+    orders = data["orders"]
+    lines = [f"Paperfly Orders — {data['phone']}", f"Total: {len(orders)}"]
+    for o in orders:
+        lines += [f"\n📦 {o['order_id']} | {o['status']}", f"📅 {o['order_date']}"]
+        if o.get("timeline"):
+            for t in o["timeline"][:3]:
+                lines.append(f"  • {t}")
+    text = urllib.parse.quote("\n".join(lines))
+    return f"https://wa.me/?text={text}"
+
+async def cmd_track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    args = ctx.args
+    if not args:
+        await update.message.reply_text(
+            "Usage: `/track <phone> [days]`\nExample: `/track 01712345678 90`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    phone = args[0]
+    days_back = 90
+    if len(args) >= 2:
+        try:
+            days_back = int(args[1])
+        except ValueError:
+            pass
+
+    await run_tracking(update, phone, days_back)
+
+async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle plain phone numbers sent as messages."""
+    text = (update.message.text or "").strip()
+    # Accept if it looks like a phone number
+    cleaned = re.sub(r"[^\d০১২৩৪৫৬৭৮৯+]", "", text)
+    if len(cleaned) >= 10:
+        await run_tracking(update, text, 90)
+    else:
+        await update.message.reply_text(
+            "Send a phone number to track, e.g. `01712345678`\nOr use /help",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    if data.startswith("retrack:"):
+        _, phone, days = data.split(":", 2)
+        await run_tracking(update, phone, int(days))
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("track", cmd_track))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    log.info("Bot started — polling...")
+    app.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
