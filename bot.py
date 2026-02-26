@@ -207,7 +207,26 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
             if not search_btn:
                 raise Exception("Search button not found")
 
-            await search_btn.click()
+            # Dismiss any popup/dialog blocking the page
+            try:
+                dialog = await page.query_selector("div.MuiDialog-root")
+                if dialog:
+                    await progress("🔲 Closing popup dialog...")
+                    await page.keyboard.press("Escape")
+                    await page.wait_for_timeout(1500)
+                    backdrop = await page.query_selector("div.MuiBackdrop-root")
+                    if backdrop:
+                        await backdrop.click(force=True)
+                        await page.wait_for_timeout(1000)
+            except Exception as de:
+                log.warning(f"Dialog dismiss: {de}")
+
+            # Use JS click to bypass overlay issues
+            try:
+                await page.evaluate("(btn) => btn.click()", search_btn)
+                await page.wait_for_timeout(1000)
+            except Exception:
+                await search_btn.click(timeout=10000)
             await page.wait_for_load_state("networkidle")
             await page.wait_for_timeout(4000)
 
@@ -455,7 +474,8 @@ async def run_tracking(update: Update, phone: str, days_back: int):
         typing_task.cancel()
 
     if data["error"]:
-        await msg.edit_text(f"❌ *Error:*\n`{data['error']}`", parse_mode=ParseMode.MARKDOWN)
+        err_short = str(data["error"])[:300]
+        await msg.edit_text(f"❌ *Error:*\n`{err_short}`", parse_mode=ParseMode.MARKDOWN)
         return
 
     result_text = format_full_result(data)
