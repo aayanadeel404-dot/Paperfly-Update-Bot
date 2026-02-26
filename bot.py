@@ -1,9 +1,5 @@
 """
 Paperfly Tracker — Telegram Bot
-Commands:
-  /start   — welcome message
-  /track   <phone> [days] — track orders
-  /help    — usage help
 """
 
 import asyncio
@@ -26,19 +22,22 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode, ChatAction
 
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.DEBUG,  # DEBUG level to catch everything
+)
+log = logging.getLogger(__name__)
+
 # ── Config ─────────────────────────────────────────────────────────────────────
-BOT_TOKEN          = os.environ["TELEGRAM_BOT_TOKEN"]
-PAPERFLY_USERNAME  = os.environ.get("PAPERFLY_USERNAME", "C172058")
-PAPERFLY_PASSWORD  = os.environ.get("PAPERFLY_PASSWORD", "7420")
-DEEPSEEK_API_KEY   = os.environ.get("DEEPSEEK_API_KEY", "")
+BOT_TOKEN         = os.environ["TELEGRAM_BOT_TOKEN"]
+PAPERFLY_USERNAME = os.environ.get("PAPERFLY_USERNAME", "C172058")
+PAPERFLY_PASSWORD = os.environ.get("PAPERFLY_PASSWORD", "7420")
+DEEPSEEK_API_KEY  = os.environ.get("DEEPSEEK_API_KEY", "")
 PAPERFLY_LOGIN_URL = "https://go.paperfly.com.bd/identity/login"
 PAPERFLY_ORDER_URL = "https://go.paperfly.com.bd/merchant/order-history"
 
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO,
-)
-log = logging.getLogger(__name__)
+log.info(f"=== BOT STARTING === TOKEN ends with: ...{BOT_TOKEN[-6:]}")
+log.info(f"=== PAPERFLY USER: {PAPERFLY_USERNAME}")
 
 # ── Phone normalization ─────────────────────────────────────────────────────────
 def normalize_phone_local(raw: str) -> str:
@@ -67,8 +66,8 @@ def normalize_phone(raw: str) -> str:
             result = resp.json()["choices"][0]["message"]["content"].strip()
             if re.match(r"^01\d{9}$", result):
                 return result
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"DeepSeek failed: {e}")
     return normalize_phone_local(raw)
 
 # ── Playwright scraper ──────────────────────────────────────────────────────────
@@ -82,9 +81,12 @@ async def type_field(el, page, text: str):
 
 async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
     async def progress(msg: str):
-        log.info(msg)
+        log.info(f"PROGRESS: {msg}")
         if progress_cb:
-            await progress_cb(msg)
+            try:
+                await progress_cb(msg)
+            except Exception as e:
+                log.warning(f"progress_cb error: {e}")
 
     orders = []
     screenshot_b64 = None
@@ -92,7 +94,7 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
     try:
         await progress("🔍 Normalizing phone number...")
         normalized = normalize_phone(phone)
-        await progress(f"📱 Phone: `{normalized}`")
+        await progress(f"📱 Phone: {normalized}")
 
         await progress("🚀 Launching browser...")
         async with async_playwright() as p:
@@ -168,7 +170,7 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
 
             all_mui = await page.query_selector_all("input.MuiInputBase-input")
 
-            await progress(f"🔎 Searching orders for `{normalized}`...")
+            await progress(f"🔎 Searching orders for {normalized}...")
             phone_inp = None
             for inp in all_mui:
                 ph = (await inp.get_attribute("placeholder") or "").lower()
@@ -219,31 +221,25 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
                 cells = await row.query_selector_all("td")
                 if len(cells) < 2:
                     continue
-
                 order_link = await row.query_selector("a[href*='single-order-history']")
                 order_id, order_href = "", ""
                 if order_link:
                     order_id = (await order_link.inner_text()).strip()
                     order_href = await order_link.get_attribute("href") or ""
-
                 has_cb = await cells[0].query_selector("input[type='checkbox']")
                 offset = 1 if has_cb else 0
-
                 async def ct(idx):
                     c = cells[idx] if idx < len(cells) else None
                     return (await c.inner_text()).strip() if c else ""
-
-                order_date  = await ct(offset)
+                order_date = await ct(offset)
                 if not order_id: order_id = await ct(offset + 1)
-                status      = await ct(offset + 2)
-                collected   = await ct(offset + 3)
-                merch_oid   = await ct(offset + 4)
-                customer    = await ct(offset + 5)
-                price       = await ct(offset + 6)
-
+                status     = await ct(offset + 2)
+                collected  = await ct(offset + 3)
+                merch_oid  = await ct(offset + 4)
+                customer   = await ct(offset + 5)
+                price      = await ct(offset + 6)
                 if not order_id:
                     continue
-
                 orders.append({
                     "order_id": order_id, "order_date": order_date,
                     "order_href": order_href, "status": status,
@@ -252,7 +248,6 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
                     "timeline": [],
                 })
 
-            # Timelines
             if orders:
                 await progress(f"📍 Fetching timelines for {len(orders)} order(s)...")
 
@@ -286,19 +281,16 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
                     await page.wait_for_load_state("networkidle")
                     await page.wait_for_timeout(2000)
                     await do_search_again()
-
                     lnk = None
                     for sel in [f"a[href='{order['order_href']}']",
                                 f"a[href*='{order['order_id']}']",
                                 "a[href*='single-order-history']"]:
                         lnk = await page.query_selector(sel)
                         if lnk: break
-
                     if lnk:
                         await lnk.click()
                         await page.wait_for_load_state("networkidle")
                         await page.wait_for_timeout(3000)
-
                         result = await page.evaluate("""() => {
                             for (const d of document.querySelectorAll('div')) {
                                 if (d.childElementCount === 0 && d.innerText.trim() === 'Timeline') {
@@ -311,7 +303,6 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
                             }
                             return { found: false, text: '' };
                         }""")
-
                         if result["found"]:
                             order["timeline"] = [
                                 l.strip() for l in result["text"].split("\n")
@@ -329,24 +320,22 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
         return {"phone": phone, "orders": [], "screenshot_b64": None, "error": str(e)}
 
 
-# ── Telegram helpers ────────────────────────────────────────────────────────────
+# ── Formatting ──────────────────────────────────────────────────────────────────
 STATUS_EMOJI = {
     "delivered": "✅", "return": "🔄", "cancel": "❌",
     "pending": "🕐", "transit": "🚚", "pickup": "📦", "point": "📍",
 }
 
-def status_emoji(status: str) -> str:
-    s = (status or "").lower()
+def status_emoji(s: str) -> str:
+    s = (s or "").lower()
     for key, emoji in STATUS_EMOJI.items():
-        if key in s:
-            return emoji
+        if key in s: return emoji
     return "📋"
 
 def format_order(order: dict, idx: int) -> str:
-    emoji = status_emoji(order["status"])
     lines = [
         f"*{idx}. {order['order_id']}*",
-        f"{emoji} {order['status']}",
+        f"{status_emoji(order['status'])} {order['status']}",
         f"📅 {order['order_date']}",
         f"💰 {order['price']}",
         f"👤 {order['customer_details']}",
@@ -364,96 +353,70 @@ def format_full_result(data: dict) -> str:
     phone = data["phone"]
     if not orders:
         return f"📭 No orders found for `{phone}`"
-
-    status_counts: dict[str, int] = {}
+    counts: dict[str, int] = {}
     for o in orders:
-        status_counts[o["status"]] = status_counts.get(o["status"], 0) + 1
-
-    summary_parts = [f"Total: *{len(orders)}*"]
-    for k, v in status_counts.items():
-        summary_parts.append(f"{status_emoji(k)} {k}: *{v}*")
-
-    lines = [
-        f"📱 *{phone}*",
-        " | ".join(summary_parts),
-        "─" * 30,
-    ]
+        counts[o["status"]] = counts.get(o["status"], 0) + 1
+    summary = [f"Total: *{len(orders)}*"] + [f"{status_emoji(k)} {k}: *{v}*" for k, v in counts.items()]
+    lines = [f"📱 *{phone}*", " | ".join(summary), "─" * 30]
     for i, order in enumerate(orders, 1):
         lines.append(format_order(order, i))
-        if i < len(orders):
-            lines.append("─" * 20)
-
+        if i < len(orders): lines.append("─" * 20)
     return "\n".join(lines)
 
 def whatsapp_url(data: dict) -> str:
     import urllib.parse
-    orders = data["orders"]
-    lines = [f"Paperfly Orders — {data['phone']}", f"Total: {len(orders)}"]
-    for o in orders:
+    lines = [f"Paperfly Orders — {data['phone']}", f"Total: {len(data['orders'])}"]
+    for o in data["orders"]:
         lines += [f"\n📦 {o['order_id']} | {o['status']}", f"📅 {o['order_date']}"]
-        if o.get("timeline"):
-            for t in o["timeline"][:3]:
-                lines.append(f"  • {t}")
-    text = urllib.parse.quote("\n".join(lines))
-    return f"https://wa.me/?text={text}"
+        for t in o.get("timeline", [])[:3]:
+            lines.append(f"  • {t}")
+    return f"https://wa.me/?text={urllib.parse.quote(chr(10).join(lines))}"
 
 
-# ── Command handlers ────────────────────────────────────────────────────────────
+# ── Handlers ────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    log.info(f"CMD /start from user {update.effective_user.id}")
     await update.message.reply_text(
         "👋 *Welcome to Paperfly Tracker Bot!*\n\n"
-        "Track your customer orders directly from Telegram.\n\n"
-        "*How to use:*\n"
-        "Just send a phone number:\n"
-        "`01712345678`\n\n"
-        "Or use the command:\n"
-        "`/track 01712345678`\n"
-        "`/track 01712345678 60` _(last 60 days)_\n\n"
-        "Type /help for more info.",
+        "Just send a phone number to track orders:\n`01712345678`\n\n"
+        "Or use: `/track 01712345678`\n\nType /help for more.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📖 *Paperfly Tracker — Help*\n\n"
-        "*Commands:*\n"
-        "`/track <phone>` — track with 90-day range\n"
-        "`/track <phone> <days>` — custom range (e.g. 30, 60, 180)\n\n"
-        "*Quick track:*\n"
-        "Just send any phone number directly!\n"
-        "Supports Bangla digits too.\n\n"
-        "*Examples:*\n"
-        "`01712345678`\n"
-        "`+8801712345678`",
+        "📖 *Help*\n\n"
+        "`/track <phone>` — 90 day range\n"
+        "`/track <phone> <days>` — custom range\n\n"
+        "Or just send a phone number directly!",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 async def run_tracking(update: Update, phone: str, days_back: int):
+    log.info(f"run_tracking called: phone={phone} days={days_back}")
     msg = await update.message.reply_text(
-        f"🔍 Starting search for `{phone}`...\n⏳ This takes 1–3 minutes, please wait.",
+        f"🔍 Searching `{phone}`...\n⏳ Please wait 1–3 minutes.",
         parse_mode=ParseMode.MARKDOWN,
     )
+    log.info("Initial message sent, starting scrape...")
 
-    # Rate-limited progress updates — only update on major steps or every 5s
     last_text = [""]
-    last_edit_time = [0.0]
-    MAJOR_KEYWORDS = ["Normalizing", "Launching", "Logging", "Logged in",
-                      "Waiting", "Searching", "Extracting", "Fetching", "Error"]
+    last_edit = [0.0]
+    MAJOR = ["Normalizing", "Launching", "Logging", "Logged in",
+             "Waiting", "Searching", "Extracting", "Fetching"]
 
     async def on_progress(text: str):
         new_text = f"{last_text[0]}\n{text}".strip()
         last_text[0] = new_text
-        is_major = any(kw in text for kw in MAJOR_KEYWORDS)
         now = asyncio.get_event_loop().time()
-        if is_major or (now - last_edit_time[0]) >= 5:
-            last_edit_time[0] = now
+        if any(k in text for k in MAJOR) or (now - last_edit[0]) >= 5:
+            last_edit[0] = now
             try:
                 await msg.edit_text(new_text, parse_mode=ParseMode.MARKDOWN)
                 await asyncio.sleep(0.5)
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning(f"edit_text failed: {e}")
 
-    # Keep typing indicator alive
     stop_typing = asyncio.Event()
     async def keep_typing():
         while not stop_typing.is_set():
@@ -464,6 +427,7 @@ async def run_tracking(update: Update, phone: str, days_back: int):
             await asyncio.sleep(4)
 
     typing_task = asyncio.create_task(keep_typing())
+    log.info("Typing task started, calling scrape_orders...")
 
     data = None
     try:
@@ -471,17 +435,18 @@ async def run_tracking(update: Update, phone: str, days_back: int):
             scrape_orders(phone, days_back, progress_cb=on_progress),
             timeout=300,
         )
+        log.info(f"scrape_orders done: {len(data.get('orders', []))} orders, error={data.get('error')}")
     except asyncio.TimeoutError:
+        log.error("scrape_orders TIMED OUT after 300s")
         await msg.edit_text(
-            f"⏰ *Timed out* after 5 minutes.\n"
-            f"Try a shorter range: `/track {phone} 30`",
+            f"⏰ *Timed out* after 5 minutes.\nTry: `/track {phone} 30`",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
     except Exception as e:
-        log.exception("Unexpected crash in run_tracking")
+        log.exception(f"CRASH in scrape_orders: {e}")
         await msg.edit_text(
-            f"❌ *Unexpected error:*\n`{str(e)}`\n\nPlease try again.",
+            f"❌ *Crashed:*\n`{str(e)}`\n\nPlease try again.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -490,10 +455,7 @@ async def run_tracking(update: Update, phone: str, days_back: int):
         typing_task.cancel()
 
     if data["error"]:
-        await msg.edit_text(
-            f"❌ *Error:*\n`{data['error']}`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await msg.edit_text(f"❌ *Error:*\n`{data['error']}`", parse_mode=ParseMode.MARKDOWN)
         return
 
     result_text = format_full_result(data)
@@ -501,77 +463,70 @@ async def run_tracking(update: Update, phone: str, days_back: int):
     if data["screenshot_b64"]:
         try:
             import io
-            img_bytes = base64.b64decode(data["screenshot_b64"])
             await update.message.reply_photo(
-                photo=io.BytesIO(img_bytes),
-                caption="📸 Search results screenshot",
+                photo=io.BytesIO(base64.b64decode(data["screenshot_b64"])),
+                caption="📸 Search results",
             )
         except Exception as e:
-            log.warning(f"Could not send screenshot: {e}")
+            log.warning(f"Screenshot send failed: {e}")
 
     if len(result_text) <= 4000:
         await msg.edit_text(result_text, parse_mode=ParseMode.MARKDOWN)
     else:
-        await msg.edit_text(
-            f"📱 *{data['phone']}* — {len(data['orders'])} orders found",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await msg.edit_text(f"📱 *{data['phone']}* — {len(data['orders'])} orders", parse_mode=ParseMode.MARKDOWN)
         for i, order in enumerate(data["orders"], 1):
             chunk = format_order(order, i)
             if len(chunk) <= 4000:
                 await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🟢 Share to WhatsApp", url=whatsapp_url(data))],
+        [InlineKeyboardButton("🟢 WhatsApp", url=whatsapp_url(data))],
         [InlineKeyboardButton("🔄 Search Again", callback_data=f"retrack:{phone}:{days_back}")],
     ])
     await update.message.reply_text("Options:", reply_markup=keyboard)
+    log.info("run_tracking complete!")
 
 async def cmd_track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    args = ctx.args
-    if not args:
-        await update.message.reply_text(
-            "Usage: `/track <phone> [days]`\nExample: `/track 01712345678 90`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+    log.info(f"CMD /track args={ctx.args}")
+    if not ctx.args:
+        await update.message.reply_text("Usage: `/track <phone> [days]`", parse_mode=ParseMode.MARKDOWN)
         return
-    phone = args[0]
+    phone = ctx.args[0]
     days_back = 90
-    if len(args) >= 2:
-        try:
-            days_back = int(args[1])
-        except ValueError:
-            pass
+    if len(ctx.args) >= 2:
+        try: days_back = int(ctx.args[1])
+        except ValueError: pass
     await run_tracking(update, phone, days_back)
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
+    log.info(f"MESSAGE received: '{text}' from user {update.effective_user.id}")
     cleaned = re.sub(r"[^\d০১২৩৪৫৬৭৮৯+]", "", text)
     if len(cleaned) >= 10:
         await run_tracking(update, text, 90)
     else:
         await update.message.reply_text(
-            "Send a phone number to track, e.g. `01712345678`\nOr use /help",
+            "Send a phone number, e.g. `01712345678`\nOr use /help",
             parse_mode=ParseMode.MARKDOWN,
         )
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data or ""
-    if data.startswith("retrack:"):
-        _, phone, days = data.split(":", 2)
+    if (query.data or "").startswith("retrack:"):
+        _, phone, days = query.data.split(":", 2)
         await run_tracking(update, phone, int(days))
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Main ────────────────────────────────────────────────────────────────────────
 def main():
+    log.info("Building application...")
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("track", cmd_track))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    log.info("Bot started — polling...")
+    log.info("Starting polling...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
