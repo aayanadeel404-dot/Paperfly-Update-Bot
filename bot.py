@@ -237,7 +237,7 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
                 cells = await row.query_selector_all("td")
                 if len(cells) < 2:
                     continue
-                order_link = await row.query_selector("a[href*='single-order-history']")
+                order_link = await row.query_selector("a[href*='/merchant/single-order-history/']")
                 order_id, order_href = "", ""
                 if order_link:
                     order_id = (await order_link.inner_text()).strip()
@@ -291,22 +291,12 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
                 if not order["order_href"]:
                     continue
                 try:
-                    oh = await page.query_selector("text=Order History")
-                    if oh: await oh.click()
-                    else: await page.goto(PAPERFLY_ORDER_URL)
+                    # Directly navigate to order detail page
+                    full_url = f"https://go.paperfly.com.bd{order['order_href']}"
+                    await page.goto(full_url)
                     await page.wait_for_load_state("networkidle")
-                    await page.wait_for_timeout(2000)
-                    await do_search_again()
-                    lnk = None
-                    for sel in [f"a[href='{order['order_href']}']",
-                                f"a[href*='{order['order_id']}']",
-                                "a[href*='single-order-history']"]:
-                        lnk = await page.query_selector(sel)
-                        if lnk: break
-                    if lnk:
-                        await lnk.click()
-                        await page.wait_for_load_state("networkidle")
-                        await page.wait_for_timeout(3000)
+                    await page.wait_for_timeout(3000)
+                    if True:
                         # Screenshot of the order detail page
                         try:
                             ss = await page.screenshot(full_page=True)
