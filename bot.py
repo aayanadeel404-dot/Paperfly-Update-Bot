@@ -254,35 +254,61 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
             await type_into_field(phone_input_el, page, normalized_phone)
 
             start_date = (datetime.now() - timedelta(days=days_back)).strftime("%m/%d/%Y")
+            dbg(f"Looking for date input, total inputs={len(all_inputs)}")
+            for idx, inp in enumerate(all_inputs):
+                ph = (await inp.get_attribute("placeholder") or "")
+                itype = (await inp.get_attribute("type") or "")
+                dbg(f"  input[{idx}] type={itype!r} placeholder={ph!r}")
             date_input_el = None
             for inp in all_inputs:
                 ph = (await inp.get_attribute("placeholder") or "").lower()
                 if "date" in ph or "from" in ph or "start" in ph or "mm/dd" in ph:
                     date_input_el = inp
+                    dbg(f"Found date input by placeholder: {ph!r}")
                     break
+            # Only use fallback if it's actually a date-type input
             if not date_input_el and len(all_inputs) > 1:
-                date_input_el = all_inputs[1]
+                itype = (await all_inputs[1].get_attribute("type") or "").lower()
+                if itype in ("date", "text", ""):
+                    date_input_el = all_inputs[1]
+                    dbg(f"Using input[1] as date field (type={itype!r})")
+                else:
+                    dbg(f"Skipping input[1] as date — type={itype!r}")
             if date_input_el:
+                dbg(f"Filling date: {start_date}")
                 await type_into_field(date_input_el, page, start_date)
+                dbg("Date filled")
+            else:
+                dbg("No date input found — skipping date filter")
 
             search_btns = await page.query_selector_all("button.MuiButton-containedPrimary")
+            dbg(f"Found {len(search_btns)} search button candidates")
             search_btn = None
             for btn in search_btns:
                 txt = (await btn.inner_text()).strip().lower()
+                dbg(f"  Button text: {txt!r}")
                 if "search" in txt or "find" in txt or "filter" in txt:
                     search_btn = btn
                     break
             if not search_btn:
                 try:
                     search_btn = await page.wait_for_selector("button.MuiButton-sizeLarge", timeout=3000)
+                    dbg("Using MuiButton-sizeLarge as search btn")
                 except Exception:
                     search_btn = search_btns[-1] if search_btns else None
+                    dbg("Using last primary button as search btn (fallback)")
             if not search_btn:
                 raise Exception("Could not find search button")
 
+            dbg("Clicking search button...")
             await search_btn.click()
-            await page.wait_for_load_state("networkidle")
+            dbg("Search clicked — waiting for results...")
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                dbg("networkidle timeout — continuing anyway")
             await page.wait_for_timeout(4000)
+            dbg(f"URL after search: {page.url}")
 
             # EXTRACT TABLE
             await progress("📊 Extracting order data...")
