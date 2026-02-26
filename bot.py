@@ -26,7 +26,7 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode, ChatAction
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Config ─────────────────────────────────────────────────────────────────────
 BOT_TOKEN          = os.environ["TELEGRAM_BOT_TOKEN"]
 PAPERFLY_USERNAME  = os.environ.get("PAPERFLY_USERNAME", "C172058")
 PAPERFLY_PASSWORD  = os.environ.get("PAPERFLY_PASSWORD", "7420")
@@ -40,7 +40,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Phone normalization ────────────────────────────────────────────────────────
+# ── Phone normalization ─────────────────────────────────────────────────────────
 def normalize_phone_local(raw: str) -> str:
     bangla = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
     num = raw.translate(bangla)
@@ -71,7 +71,7 @@ def normalize_phone(raw: str) -> str:
             pass
     return normalize_phone_local(raw)
 
-# ── Playwright scraper ─────────────────────────────────────────────────────────
+# ── Playwright scraper ──────────────────────────────────────────────────────────
 async def type_field(el, page, text: str):
     await el.click()
     await page.keyboard.press("Control+a")
@@ -81,8 +81,6 @@ async def type_field(el, page, text: str):
     await page.wait_for_timeout(350)
 
 async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
-    """Scrape Paperfly and return order data. progress_cb(msg) called with status updates."""
-
     async def progress(msg: str):
         log.info(msg)
         if progress_cb:
@@ -90,7 +88,6 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
 
     orders = []
     screenshot_b64 = None
-    error = None
 
     try:
         await progress("🔍 Normalizing phone number...")
@@ -103,7 +100,6 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
             ctx = await browser.new_context(viewport={"width": 1366, "height": 900})
             page = await ctx.new_page()
 
-            # Login
             await progress("🔐 Logging into Paperfly...")
             await page.goto(PAPERFLY_LOGIN_URL)
             await page.wait_for_timeout(5000)
@@ -140,7 +136,6 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
 
             await progress("✅ Logged in! Opening Order History...")
 
-            # Navigate to order history
             oh_link = None
             for sel in ["text=Order History", "a[href*='order-history']", "span:has-text('Order History')"]:
                 try:
@@ -158,7 +153,6 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
                 await page.wait_for_load_state("networkidle")
                 await page.wait_for_timeout(2000)
 
-            # Wait for page to render
             await progress("⏳ Waiting for page to render...")
             found = False
             for _ in range(30):
@@ -172,10 +166,9 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
             if not found:
                 raise Exception("Order history page did not render in time")
 
-            # Fill search form
-            await progress(f"🔎 Searching orders for `{normalized}`...")
             all_mui = await page.query_selector_all("input.MuiInputBase-input")
 
+            await progress(f"🔎 Searching orders for `{normalized}`...")
             phone_inp = None
             for inp in all_mui:
                 ph = (await inp.get_attribute("placeholder") or "").lower()
@@ -199,7 +192,6 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
             if date_inp:
                 await type_field(date_inp, page, start_date)
 
-            # Click search
             search_btns = await page.query_selector_all("button.MuiButton-containedPrimary")
             search_btn = None
             for btn in search_btns:
@@ -217,11 +209,9 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
             await page.wait_for_load_state("networkidle")
             await page.wait_for_timeout(4000)
 
-            # Screenshot
             ss_data = await page.screenshot(full_page=False)
             screenshot_b64 = base64.b64encode(ss_data).decode()
 
-            # Extract table
             await progress("📊 Extracting order data...")
             rows = await page.query_selector_all("table tbody tr")
 
@@ -332,18 +322,14 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
 
             await browser.close()
 
-        return {
-            "phone": normalized,
-            "orders": orders,
-            "screenshot_b64": screenshot_b64,
-            "error": None,
-        }
+        return {"phone": normalized, "orders": orders, "screenshot_b64": screenshot_b64, "error": None}
 
     except Exception as e:
-        log.error(f"Scrape error: {e}")
+        log.error(f"Scrape error: {e}", exc_info=True)
         return {"phone": phone, "orders": [], "screenshot_b64": None, "error": str(e)}
 
-# ── Telegram helpers ───────────────────────────────────────────────────────────
+
+# ── Telegram helpers ────────────────────────────────────────────────────────────
 STATUS_EMOJI = {
     "delivered": "✅", "return": "🔄", "cancel": "❌",
     "pending": "🕐", "transit": "🚚", "pickup": "📦", "point": "📍",
@@ -367,7 +353,7 @@ def format_order(order: dict, idx: int) -> str:
     ]
     if order.get("timeline"):
         lines.append("📍 *Timeline:*")
-        for t in order["timeline"][:6]:  # cap at 6 entries
+        for t in order["timeline"][:6]:
             lines.append(f"  • {t}")
         if len(order["timeline"]) > 6:
             lines.append(f"  _...+{len(order['timeline'])-6} more_")
@@ -379,7 +365,6 @@ def format_full_result(data: dict) -> str:
     if not orders:
         return f"📭 No orders found for `{phone}`"
 
-    # Summary
     status_counts: dict[str, int] = {}
     for o in orders:
         status_counts[o["status"]] = status_counts.get(o["status"], 0) + 1
@@ -393,7 +378,6 @@ def format_full_result(data: dict) -> str:
         " | ".join(summary_parts),
         "─" * 30,
     ]
-
     for i, order in enumerate(orders, 1):
         lines.append(format_order(order, i))
         if i < len(orders):
@@ -401,7 +385,20 @@ def format_full_result(data: dict) -> str:
 
     return "\n".join(lines)
 
-# ── Command handlers ───────────────────────────────────────────────────────────
+def whatsapp_url(data: dict) -> str:
+    import urllib.parse
+    orders = data["orders"]
+    lines = [f"Paperfly Orders — {data['phone']}", f"Total: {len(orders)}"]
+    for o in orders:
+        lines += [f"\n📦 {o['order_id']} | {o['status']}", f"📅 {o['order_date']}"]
+        if o.get("timeline"):
+            for t in o["timeline"][:3]:
+                lines.append(f"  • {t}")
+    text = urllib.parse.quote("\n".join(lines))
+    return f"https://wa.me/?text={text}"
+
+
+# ── Command handlers ────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Welcome to Paperfly Tracker Bot!*\n\n"
@@ -424,31 +421,39 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "`/track <phone> <days>` — custom range (e.g. 30, 60, 180)\n\n"
         "*Quick track:*\n"
         "Just send any phone number directly!\n"
-        "Supports Bangla digits (০১৭১২৩৪৫৬৭৮) too.\n\n"
+        "Supports Bangla digits too.\n\n"
         "*Examples:*\n"
         "`01712345678`\n"
-        "`+8801712345678`\n"
-        "`০১৭১২৩৪৫৬৭৮`",
+        "`+8801712345678`",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 async def run_tracking(update: Update, phone: str, days_back: int):
     msg = await update.message.reply_text(
-        f"🔍 Starting search for `{phone}`...\n⏳ This takes 1–3 minutes.",
+        f"🔍 Starting search for `{phone}`...\n⏳ This takes 1–3 minutes, please wait.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    # Live progress updates
+    # Rate-limited progress updates — only update on major steps or every 5s
     last_text = [""]
+    last_edit_time = [0.0]
+    MAJOR_KEYWORDS = ["Normalizing", "Launching", "Logging", "Logged in",
+                      "Waiting", "Searching", "Extracting", "Fetching", "Error"]
+
     async def on_progress(text: str):
         new_text = f"{last_text[0]}\n{text}".strip()
         last_text[0] = new_text
-        try:
-            await msg.edit_text(new_text, parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            pass
+        is_major = any(kw in text for kw in MAJOR_KEYWORDS)
+        now = asyncio.get_event_loop().time()
+        if is_major or (now - last_edit_time[0]) >= 5:
+            last_edit_time[0] = now
+            try:
+                await msg.edit_text(new_text, parse_mode=ParseMode.MARKDOWN)
+                await asyncio.sleep(0.5)
+            except Exception:
+                pass
 
-    # Keep "typing" indicator alive every 4 seconds
+    # Keep typing indicator alive
     stop_typing = asyncio.Event()
     async def keep_typing():
         while not stop_typing.is_set():
@@ -460,17 +465,23 @@ async def run_tracking(update: Update, phone: str, days_back: int):
 
     typing_task = asyncio.create_task(keep_typing())
 
+    data = None
     try:
         data = await asyncio.wait_for(
             scrape_orders(phone, days_back, progress_cb=on_progress),
-            timeout=300,  # 5 minute hard limit
+            timeout=300,
         )
     except asyncio.TimeoutError:
-        stop_typing.set()
-        typing_task.cancel()
         await msg.edit_text(
-            "⏰ *Timed out* — search took longer than 5 minutes.\n"
-            "Try again or use a shorter date range: `/track " + phone + " 30`",
+            f"⏰ *Timed out* after 5 minutes.\n"
+            f"Try a shorter range: `/track {phone} 30`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    except Exception as e:
+        log.exception("Unexpected crash in run_tracking")
+        await msg.edit_text(
+            f"❌ *Unexpected error:*\n`{str(e)}`\n\nPlease try again.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -487,7 +498,6 @@ async def run_tracking(update: Update, phone: str, days_back: int):
 
     result_text = format_full_result(data)
 
-    # Send screenshot first if available
     if data["screenshot_b64"]:
         try:
             import io
@@ -499,11 +509,9 @@ async def run_tracking(update: Update, phone: str, days_back: int):
         except Exception as e:
             log.warning(f"Could not send screenshot: {e}")
 
-    # Send text result (split if too long)
     if len(result_text) <= 4000:
         await msg.edit_text(result_text, parse_mode=ParseMode.MARKDOWN)
     else:
-        # Send in chunks per order
         await msg.edit_text(
             f"📱 *{data['phone']}* — {len(data['orders'])} orders found",
             parse_mode=ParseMode.MARKDOWN,
@@ -513,24 +521,11 @@ async def run_tracking(update: Update, phone: str, days_back: int):
             if len(chunk) <= 4000:
                 await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
 
-    # Share buttons
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🟢 Share to WhatsApp", url=whatsapp_url(data))],
         [InlineKeyboardButton("🔄 Search Again", callback_data=f"retrack:{phone}:{days_back}")],
     ])
     await update.message.reply_text("Options:", reply_markup=keyboard)
-
-def whatsapp_url(data: dict) -> str:
-    import urllib.parse
-    orders = data["orders"]
-    lines = [f"Paperfly Orders — {data['phone']}", f"Total: {len(orders)}"]
-    for o in orders:
-        lines += [f"\n📦 {o['order_id']} | {o['status']}", f"📅 {o['order_date']}"]
-        if o.get("timeline"):
-            for t in o["timeline"][:3]:
-                lines.append(f"  • {t}")
-    text = urllib.parse.quote("\n".join(lines))
-    return f"https://wa.me/?text={text}"
 
 async def cmd_track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = ctx.args
@@ -540,7 +535,6 @@ async def cmd_track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN,
         )
         return
-
     phone = args[0]
     days_back = 90
     if len(args) >= 2:
@@ -548,13 +542,10 @@ async def cmd_track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             days_back = int(args[1])
         except ValueError:
             pass
-
     await run_tracking(update, phone, days_back)
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle plain phone numbers sent as messages."""
     text = (update.message.text or "").strip()
-    # Accept if it looks like a phone number
     cleaned = re.sub(r"[^\d০১২৩৪৫৬৭৮৯+]", "", text)
     if len(cleaned) >= 10:
         await run_tracking(update, text, 90)
@@ -580,7 +571,6 @@ def main():
     app.add_handler(CommandHandler("track", cmd_track))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
     log.info("Bot started — polling...")
     app.run_polling(drop_pending_updates=True)
 
