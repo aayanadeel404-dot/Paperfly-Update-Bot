@@ -228,15 +228,28 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
             if not found:
                 raise Exception("Order history page did not render in time.")
 
-            # CLOSE POPUP
-            try:
-                close_btn = await page.wait_for_selector(
-                    "button[aria-label='close'], div[role='dialog'] button", timeout=3000)
-                await close_btn.click()
-                await progress("🔲 Closed popup dialog...")
-                await page.wait_for_timeout(1000)
-            except Exception:
-                pass
+            # CLOSE ANY POPUP/DIALOG that might block the search button
+            # (Paperfly sometimes shows a MuiDialog announcement after login)
+            for _attempt in range(3):
+                try:
+                    dialog = await page.query_selector("div[role='dialog'], div.MuiDialog-root")
+                    if not dialog:
+                        break
+                    # Try aria-label close button first, then any button inside the dialog
+                    close_btn = await page.query_selector(
+                        "div[role='dialog'] button[aria-label='close'], "
+                        "div.MuiDialog-root button[aria-label='close'], "
+                        "div[role='dialog'] button.MuiIconButton-root"
+                    )
+                    if close_btn:
+                        await close_btn.click()
+                    else:
+                        # Last resort: press Escape to close the dialog
+                        await page.keyboard.press("Escape")
+                    await progress("🔲 Closed popup dialog...")
+                    await page.wait_for_timeout(800)
+                except Exception:
+                    break
 
             # FILL SEARCH FORM
             await progress(f"🔎 Searching orders for {normalized_phone}...")
@@ -435,7 +448,9 @@ def format_result(result: dict) -> str:
     error  = result.get("error")
 
     if error and not orders:
-        return f"❌ *Error*\n`{error}`"
+        # Strip chars that break Telegram Markdown (backtick, underscore, asterisk, bracket)
+        safe_error = re.sub(r'[`*_\[\]()]', '', str(error))[:300]
+        return f"❌ Error:\n{safe_error}"
     if not orders:
         return f"📭 No orders found for `{phone}`"
 
@@ -501,8 +516,18 @@ async def run_tracking(phone: str, days_back: int, chat_id: int, context):
             chat_id=chat_id, message_id=status_msg.message_id,
             text=msg_text[:4096], parse_mode=ParseMode.MARKDOWN,
         )
-    except Exception:
-        await context.bot.send_message(chat_id=chat_id, text=msg_text[:4096], parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        log.warning(f"edit_message_text failed ({e}), falling back to plain text")
+        try:
+            # Fall back to plain text (no parse_mode) to guarantee delivery
+            plain = re.sub(r'[*_`\[\]]', '', msg_text)  # strip markdown symbols
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=status_msg.message_id,
+                text=plain[:4096],
+            )
+        except Exception:
+            plain = re.sub(r'[*_`\[\]]', '', msg_text)
+            await context.bot.send_message(chat_id=chat_id, text=plain[:4096])
 
     shots_sent = 0
     for o in result.get("orders", []):
@@ -580,6 +605,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.info(f"Re-tracking {phone} for {days} days")
             await run_tracking(phone, days, chat_id, context)
 
+async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    """Log errors cleanly — especially Conflict during Railway rolling restarts."""
+    import telegram.error as tg_err
+    err = context.error
+    if isinstance(err, tg_err.Conflict):
+        # This happens when a new instance starts before the old one fully stops.
+        # It is harmless and self-resolving — just log at INFO level.
+        log.info(f"Conflict (likely rolling restart, will resolve): {err}")
+    elif isinstance(err, tg_err.NetworkError):
+        log.warning(f"Network error (will retry): {err}")
+    else:
+        log.exception(f"Unhandled update error: {err}")
+
+
 def main():
     log.info("Building application...")
     app = Application.builder().token(BOT_TOKEN).build()
@@ -587,6 +626,7 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_error_handler(error_handler)   # handle Conflict, NetworkError, etc. gracefully
     log.info("Starting polling...")
     app.run_polling(drop_pending_updates=True)
 
