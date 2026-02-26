@@ -309,51 +309,81 @@ async def scrape_orders(phone: str, days_back: int, progress_cb=None) -> dict:
                 await page.wait_for_load_state("networkidle")
                 await page.wait_for_timeout(4000)
 
+            async def relogin_session():
+                log.info("Re-authenticating session...")
+                await page.goto(PAPERFLY_LOGIN_URL)
+                await page.wait_for_timeout(3000)
+                try:
+                    u = await page.wait_for_selector("input[type='text'].MuiInputBase-input", timeout=10000)
+                    await type_field(u, page, PAPERFLY_USERNAME)
+                    pw = await page.wait_for_selector("input[type='password']", timeout=5000)
+                    await type_field(pw, page, PAPERFLY_PASSWORD)
+                    await pw.press("Enter")
+                    await page.wait_for_load_state("networkidle")
+                    await page.wait_for_timeout(3000)
+                    log.info(f"Re-login URL: {page.url}")
+                    return "/identity/login" not in page.url
+                except Exception as e:
+                    log.warning(f"Re-login failed: {e}")
+                    return False
+
             for oi, order in enumerate(orders):
                 if not order["order_href"]:
                     continue
                 try:
-                    # Directly navigate to order detail page
                     full_url = f"https://go.paperfly.com.bd{order['order_href']}"
                     log.debug(f"Navigating to: {full_url}")
                     await page.goto(full_url)
                     await page.wait_for_load_state("networkidle")
                     await page.wait_for_timeout(3000)
 
-                    # Check if we got redirected to login page
                     current_url = page.url
                     log.debug(f"Current URL after navigation: {current_url}")
-                    if "/identity/login" in current_url or "/login" in current_url:
-                        log.warning("Session expired — redirected to login. Skipping screenshot.")
-                        order["timeline"] = ["⚠️ Session expired during detail fetch"]
-                        continue
 
-                    if True:
-                        # Screenshot of the order detail page
-                        try:
-                            ss = await page.screenshot(full_page=True)
-                            order["screenshot_b64"] = base64.b64encode(ss).decode()
-                        except Exception:
-                            pass
-                        result = await page.evaluate("""() => {
-                            for (const d of document.querySelectorAll('div')) {
-                                if (d.childElementCount === 0 && d.innerText.trim() === 'Timeline') {
-                                    let p = d.parentElement;
-                                    for (let i = 0; i < 8; i++) {
-                                        if (p && p.children.length > 1) return { found: true, text: p.innerText };
-                                        if (p) p = p.parentElement;
-                                    }
+                    # If redirected to login, re-authenticate and retry
+                    if "/identity/login" in current_url or "/login" in current_url:
+                        log.warning("Session expired — attempting re-login...")
+                        ok = await relogin_session()
+                        if ok:
+                            log.info(f"Re-login succeeded, retrying: {full_url}")
+                            await page.goto(full_url)
+                            await page.wait_for_load_state("networkidle")
+                            await page.wait_for_timeout(3000)
+                            current_url = page.url
+                        if "/identity/login" in current_url or "/login" in current_url:
+                            log.warning("Still on login after re-auth. Skipping order detail.")
+                            order["timeline"] = ["⚠️ Could not load order detail"]
+                            continue
+
+                    # Screenshot
+                    try:
+                        ss = await page.screenshot(full_page=True)
+                        order["screenshot_b64"] = base64.b64encode(ss).decode()
+                        log.info(f"Screenshot captured for {order['order_id']}, size={len(ss)}")
+                    except Exception as e:
+                        log.warning(f"Screenshot failed: {e}")
+
+                    result = await page.evaluate("""() => {
+                        for (const d of document.querySelectorAll('div')) {
+                            if (d.childElementCount === 0 && d.innerText.trim() === 'Timeline') {
+                                let p = d.parentElement;
+                                for (let i = 0; i < 8; i++) {
+                                    if (p && p.children.length > 1) return { found: true, text: p.innerText };
+                                    if (p) p = p.parentElement;
                                 }
                             }
-                            return { found: false, text: '' };
-                        }""")
-                        if result["found"]:
-                            order["timeline"] = [
-                                l.strip() for l in result["text"].split("\n")
-                                if l.strip() and l.strip() != "Timeline"
-                            ]
+                        }
+                        return { found: false, text: '' };
+                    }""")
+                    if result["found"]:
+                        order["timeline"] = [
+                            l.strip() for l in result["text"].split("\n")
+                            if l.strip() and l.strip() != "Timeline"
+                        ]
+                    log.info(f"Order {order['order_id']}: timeline={order['timeline']}")
                 except Exception as te:
                     log.warning(f"Timeline error for {order['order_id']}: {te}")
+
 
             await browser.close()
 
